@@ -282,120 +282,170 @@ func sendEmail(item Item, keywords []string) error {
 <html>
 <head>
   <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <style>
+    * {
+      box-sizing: border-box;
+    }
     body {
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
       line-height: 1.6;
-      color: #333;
-      background-color: #f5f5f5;
+      color: #000;
+      background-color: #fafafa;
       margin: 0;
       padding: 20px;
+      font-size: 14px;
     }
     .container {
       max-width: 600px;
       margin: 0 auto;
-      background-color: #ffffff;
+      background-color: #fff;
+      border: 1px solid #e5e5e5;
       border-radius: 8px;
       overflow: hidden;
-      box-shadow: 0 2px 8px rgba(0,0,0,0.1);
     }
     .header {
-      background: linear-gradient(135deg, #667eea 0%%, #764ba2 100%%);
-      color: white;
-      padding: 30px 20px;
+      background-color: #000;
+      color: #fff;
+      padding: 24px 24px;
+      border-bottom: 1px solid #e5e5e5;
     }
-    .header h2 {
+    .header h1 {
       margin: 0;
-      font-size: 20px;
+      font-size: 18px;
       font-weight: 600;
+      line-height: 1.4;
     }
     .content {
-      padding: 30px 20px;
+      padding: 24px;
+    }
+    .section {
+      margin-bottom: 24px;
+    }
+    .section:last-child {
+      margin-bottom: 0;
+    }
+    .label {
+      font-size: 12px;
+      color: #666;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      margin-bottom: 8px;
+      font-weight: 500;
     }
     .keywords {
       display: inline-block;
-      background-color: #e8f5e9;
-      color: #2e7d32;
-      padding: 4px 12px;
-      border-radius: 12px;
-      font-size: 14px;
+      background-color: #000;
+      color: #fff;
+      padding: 4px 10px;
+      border-radius: 4px;
+      font-size: 12px;
       font-weight: 500;
-      margin: 2px 4px 2px 0;
+      margin: 4px 4px 4px 0;
     }
     .meta {
-      background-color: #f9f9f9;
-      padding: 15px;
+      background-color: #fafafa;
+      border: 1px solid #e5e5e5;
       border-radius: 6px;
-      margin: 20px 0;
-      font-size: 14px;
+      padding: 16px;
+      margin: 16px 0;
     }
     .meta-item {
+      display: flex;
       margin: 8px 0;
-      color: #666;
+      font-size: 13px;
     }
-    .meta-item strong {
-      color: #333;
+    .meta-item:first-child {
+      margin-top: 0;
+    }
+    .meta-item:last-child {
+      margin-bottom: 0;
+    }
+    .meta-label {
+      color: #666;
       min-width: 80px;
-      display: inline-block;
+      font-weight: 500;
+    }
+    .meta-value {
+      color: #000;
+      flex: 1;
     }
     .description {
-      margin: 20px 0;
-      padding: 15px;
       background-color: #fafafa;
-      border-left: 4px solid #667eea;
-      border-radius: 4px;
-      font-size: 15px;
+      border-left: 3px solid #000;
+      padding: 16px;
+      margin: 16px 0;
+      font-size: 14px;
       line-height: 1.7;
+      color: #333;
+    }
+    .description p {
+      margin: 0;
+    }
+    .button-wrapper {
+      margin-top: 24px;
+      padding-top: 24px;
+      border-top: 1px solid #e5e5e5;
     }
     .link-button {
       display: inline-block;
-      margin-top: 20px;
-      padding: 12px 30px;
-      background: linear-gradient(135deg, #667eea 0%%, #764ba2 100%%);
-      color: white !important;
+      padding: 10px 20px;
+      background-color: #000;
+      color: #fff !important;
       text-decoration: none;
       border-radius: 6px;
       font-weight: 500;
-      transition: transform 0.2s;
+      font-size: 13px;
+      border: 1px solid #000;
+      transition: all 0.2s ease;
     }
     .link-button:hover {
-      transform: translateY(-2px);
+      background-color: #333;
+      border-color: #333;
     }
     .footer {
       text-align: center;
-      padding: 20px;
-      color: #999;
+      padding: 16px;
+      color: #666;
       font-size: 12px;
-      border-top: 1px solid #eee;
+      background-color: #fafafa;
+      border-top: 1px solid #e5e5e5;
     }
   </style>
 </head>
 <body>
   <div class="container">
     <div class="header">
-      <h2>%s</h2>
+      <h1>%s</h1>
     </div>
     <div class="content">
-      <div>
-        <strong>匹配关键词：</strong>
-        %s
+      <div class="section">
+        <div class="label">匹配关键词</div>
+        <div>
+          %s
+        </div>
       </div>
       <div class="meta">
         <div class="meta-item">
-          <strong>发布时间：</strong>%s
+          <span class="meta-label">发布时间</span>
+          <span class="meta-value">%s</span>
         </div>
         <div class="meta-item">
-          <strong>作者：</strong>%s
+          <span class="meta-label">作者</span>
+          <span class="meta-value">%s</span>
         </div>
         <div class="meta-item">
-          <strong>分类：</strong>%s
+          <span class="meta-label">分类</span>
+          <span class="meta-value">%s</span>
         </div>
       </div>
-      <div class="description">
-        <strong>内容摘要：</strong>
-        <p style="margin: 10px 0 0 0;">%s</p>
+      <div class="section">
+        <div class="label">内容摘要</div>
+        <div class="description">
+          <p>%s</p>
+        </div>
       </div>
-      <div style="text-align: center;">
+      <div class="button-wrapper">
         <a href="%s" class="link-button" target="_blank">查看完整内容 →</a>
       </div>
     </div>
