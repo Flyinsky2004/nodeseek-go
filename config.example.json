@@ -1,0 +1,29 @@
+{
+  "rss": {
+    "url": "https://www.nodeseek.com/rss.xml",
+    "interval_seconds": 30,
+    "cron": ""
+  },
+  "keywords": [
+    "德鸡",
+    "绿云",
+    "V.PS",
+    "搬瓦工"
+  ],
+  "smtp": {
+    "host": "smtp.gmail.com",
+    "port": 587,
+    "user": "your-email@gmail.com",
+    "pass": "your-app-password",
+    "secure": false
+  },
+  "email": {
+    "from": "your-email@gmail.com",
+    "to": [
+      "recipient1@example.com",
+      "recipient2@example.com"
+    ],
+    "subject": "[NodeSeek RSS] {title}"
+  },
+  "cache_file": "sent_cache.json"
+}

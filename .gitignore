@@ -1,0 +1,22 @@
+# Go
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+go.sum
+
+# 配置和缓存文件
+config.json
+sent_cache.json
+
+# 日志
+*.log
+
+# 系统文件
+.DS_Store
+.env
+
+config.json
