@@ -87,6 +87,14 @@ func main() {
 	// 加载缓存文件
 	loadCache()
 
+	// 发送启动测试邮件
+	log.Println("发送启动测试邮件...")
+	if err := sendTestEmail(); err != nil {
+		log.Printf("测试邮件发送失败: %v (程序将继续运行)", err)
+	} else {
+		log.Println("测试邮件发送成功")
+	}
+
 	// 立即执行一次
 	log.Println("立即执行一次 RSS 检查...")
 	if err := checkRSS(); err != nil {
@@ -270,6 +278,203 @@ func checkRSS() error {
 
 	// 保存缓存
 	return saveCache()
+}
+
+// sendTestEmail 发送测试邮件
+func sendTestEmail() error {
+	subject := "[NodeSeek RSS] 程序启动测试邮件"
+
+	// 构建测试邮件内容
+	htmlBody := fmt.Sprintf(`
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <style>
+    * {
+      box-sizing: border-box;
+    }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+      line-height: 1.6;
+      color: #000;
+      background-color: #fafafa;
+      margin: 0;
+      padding: 20px;
+      font-size: 14px;
+    }
+    .container {
+      max-width: 600px;
+      margin: 0 auto;
+      background-color: #fff;
+      border: 1px solid #e5e5e5;
+      border-radius: 8px;
+      overflow: hidden;
+    }
+    .header {
+      background-color: #000;
+      color: #fff;
+      padding: 24px 24px;
+      border-bottom: 1px solid #e5e5e5;
+    }
+    .header h1 {
+      margin: 0;
+      font-size: 18px;
+      font-weight: 600;
+      line-height: 1.4;
+    }
+    .content {
+      padding: 24px;
+    }
+    .section {
+      margin-bottom: 24px;
+    }
+    .section:last-child {
+      margin-bottom: 0;
+    }
+    .label {
+      font-size: 12px;
+      color: #666;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      margin-bottom: 8px;
+      font-weight: 500;
+    }
+    .status {
+      display: inline-block;
+      background-color: #000;
+      color: #fff;
+      padding: 6px 12px;
+      border-radius: 4px;
+      font-size: 13px;
+      font-weight: 500;
+    }
+    .status.success {
+      background-color: #10b981;
+    }
+    .info-box {
+      background-color: #fafafa;
+      border: 1px solid #e5e5e5;
+      border-radius: 6px;
+      padding: 16px;
+      margin: 16px 0;
+    }
+    .info-item {
+      display: flex;
+      margin: 8px 0;
+      font-size: 13px;
+    }
+    .info-item:first-child {
+      margin-top: 0;
+    }
+    .info-item:last-child {
+      margin-bottom: 0;
+    }
+    .info-label {
+      color: #666;
+      min-width: 120px;
+      font-weight: 500;
+    }
+    .info-value {
+      color: #000;
+      flex: 1;
+      word-break: break-all;
+    }
+    .footer {
+      text-align: center;
+      padding: 16px;
+      color: #666;
+      font-size: 12px;
+      background-color: #fafafa;
+      border-top: 1px solid #e5e5e5;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="header">
+      <h1>✅ 程序启动成功</h1>
+    </div>
+    <div class="content">
+      <div class="section">
+        <div class="label">状态</div>
+        <div>
+          <span class="status success">运行中</span>
+        </div>
+      </div>
+      <div class="section">
+        <div class="label">配置信息</div>
+        <div class="info-box">
+          <div class="info-item">
+            <span class="info-label">RSS 源</span>
+            <span class="info-value">%s</span>
+          </div>
+          <div class="info-item">
+            <span class="info-label">监控关键词</span>
+            <span class="info-value">%s</span>
+          </div>
+          <div class="info-item">
+            <span class="info-label">执行频率</span>
+            <span class="info-value">%s</span>
+          </div>
+          <div class="info-item">
+            <span class="info-label">收件人</span>
+            <span class="info-value">%s</span>
+          </div>
+        </div>
+      </div>
+      <div class="section">
+        <div class="label">说明</div>
+        <p style="margin: 8px 0 0 0; color: #666; font-size: 13px; line-height: 1.7;">
+          这是一封启动测试邮件，用于验证 SMTP 配置是否正确。如果您收到这封邮件，说明邮件发送功能正常。程序将按照配置的频率自动监控 RSS 源，发现匹配关键词的新帖时会自动发送邮件通知。
+        </p>
+      </div>
+    </div>
+    <div class="footer">
+      NodeSeek RSS Monitor · %s
+    </div>
+  </div>
+</body>
+</html>
+	`,
+		config.RSS.URL,
+		strings.Join(config.Keywords, ", "),
+		getScheduleDesc(),
+		strings.Join(config.Email.To, ", "),
+		time.Now().Format("2006-01-02 15:04:05"),
+	)
+
+	// 创建邮件
+	m := gomail.NewMessage()
+	m.SetHeader("From", config.Email.From)
+	m.SetHeader("To", config.Email.To...)
+	m.SetHeader("Subject", subject)
+	m.SetBody("text/html", htmlBody)
+
+	// 创建 SMTP 拨号器
+	d := gomail.NewDialer(
+		config.SMTP.Host,
+		config.SMTP.Port,
+		config.SMTP.User,
+		config.SMTP.Pass,
+	)
+
+	// 发送邮件
+	if err := d.DialAndSend(m); err != nil {
+		return fmt.Errorf("发送测试邮件失败: %w", err)
+	}
+
+	return nil
+}
+
+// getScheduleDesc 获取调度描述
+func getScheduleDesc() string {
+	if config.RSS.IntervalSeconds > 0 {
+		return fmt.Sprintf("每 %d 秒执行一次", config.RSS.IntervalSeconds)
+	} else if config.RSS.Cron != "" {
+		return fmt.Sprintf("Cron: %s", config.RSS.Cron)
+	}
+	return "未配置"
 }
 
 // sendEmail 发送邮件
