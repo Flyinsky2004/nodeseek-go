@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"encoding/xml"
 	"fmt"
@@ -10,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/robfig/cron/v3"
@@ -36,6 +38,10 @@ type Config struct {
 		To      []string `json:"to"`
 		Subject string   `json:"subject"`
 	} `json:"email"`
+	Telegram struct {
+		Token   string  `json:"token"`
+		ChatIDs []int64 `json:"chat_ids"`
+	} `json:"telegram"`
 	CacheFile string `json:"cache_file"`
 }
 
@@ -69,9 +75,30 @@ type SentCache struct {
 
 var (
 	config    Config
+	configMu  sync.RWMutex // 保护 config.Keywords 的并发读写
 	sentCache SentCache
 	execDir   string
 )
+
+// Telegram Bot API 响应结构
+type tgUpdatesResp struct {
+	OK     bool       `json:"ok"`
+	Result []tgUpdate `json:"result"`
+}
+
+type tgUpdate struct {
+	UpdateID int        `json:"update_id"`
+	Message  *tgMessage `json:"message"`
+}
+
+type tgMessage struct {
+	Chat tgChat `json:"chat"`
+	Text string `json:"text"`
+}
+
+type tgChat struct {
+	ID int64 `json:"id"`
+}
 
 func main() {
 	// 获取可执行文件所在目录
@@ -93,6 +120,21 @@ func main() {
 		log.Printf("测试邮件发送失败: %v (程序将继续运行)", err)
 	} else {
 		log.Println("测试邮件发送成功")
+	}
+
+	// 发送启动 Telegram 通知
+	if telegramEnabled() {
+		log.Println("发送启动 Telegram 通知...")
+		if err := sendTelegramTestMessage(); err != nil {
+			log.Printf("Telegram 启动通知发送失败: %v (程序将继续运行)", err)
+		} else {
+			log.Println("Telegram 启动通知发送成功")
+		}
+	}
+
+	// 启动 Telegram Bot 命令监听
+	if telegramEnabled() {
+		go startTelegramPolling()
 	}
 
 	// 立即执行一次
@@ -231,6 +273,12 @@ func checkRSS() error {
 
 	log.Printf("解析到 %d 条 RSS 项", len(rss.Channel.Items))
 
+	// 快照当前关键词，避免遍历过程中被并发修改
+	configMu.RLock()
+	keywords := make([]string, len(config.Keywords))
+	copy(keywords, config.Keywords)
+	configMu.RUnlock()
+
 	processedCount := 0
 	sentCount := 0
 
@@ -245,7 +293,7 @@ func checkRSS() error {
 
 		// 检查是否匹配关键词
 		matchedKeywords := []string{}
-		for _, keyword := range config.Keywords {
+		for _, keyword := range keywords {
 			if strings.Contains(item.Title, keyword) || strings.Contains(item.Description, keyword) {
 				matchedKeywords = append(matchedKeywords, keyword)
 			}
@@ -254,9 +302,25 @@ func checkRSS() error {
 		if len(matchedKeywords) > 0 {
 			log.Printf("匹配到关键词 [%s]: %s", strings.Join(matchedKeywords, ", "), item.Title)
 
+			notifyFailed := false
+
 			// 发送邮件
-			if err := sendEmail(item, matchedKeywords); err != nil {
-				log.Printf("发送邮件失败: %v", err)
+			if emailEnabled() {
+				if err := sendEmail(item, matchedKeywords); err != nil {
+					log.Printf("发送邮件失败: %v", err)
+					notifyFailed = true
+				}
+			}
+
+			// 发送 Telegram 通知
+			if telegramEnabled() {
+				if err := sendTelegramNotification(item, matchedKeywords); err != nil {
+					log.Printf("发送 Telegram 通知失败: %v", err)
+					notifyFailed = true
+				}
+			}
+
+			if notifyFailed {
 				continue
 			}
 
@@ -274,7 +338,7 @@ func checkRSS() error {
 		}
 	}
 
-	log.Printf("任务完成 - 处理: %d 条新项, 发送: %d 封邮件", processedCount, sentCount)
+	log.Printf("任务完成 - 处理: %d 条新项, 发送: %d 条通知", processedCount, sentCount)
 
 	// 保存缓存
 	return saveCache()
@@ -701,4 +765,318 @@ func formatKeywords(keywords []string) string {
 		result = append(result, fmt.Sprintf(`<span class="keywords">%s</span>`, kw))
 	}
 	return strings.Join(result, "")
+}
+
+// saveConfig 将当前配置持久化到 config.json
+func saveConfig() error {
+	configPath := filepath.Join(execDir, "config.json")
+	configMu.RLock()
+	data, err := json.MarshalIndent(config, "", "  ")
+	configMu.RUnlock()
+	if err != nil {
+		return err
+	}
+	return ioutil.WriteFile(configPath, data, 0644)
+}
+
+// isAllowedChat 检查 chatID 是否在白名单中
+func isAllowedChat(chatID int64) bool {
+	for _, id := range config.Telegram.ChatIDs {
+		if id == chatID {
+			return true
+		}
+	}
+	return false
+}
+
+// startTelegramPolling 启动 Telegram 长轮询，接收 Bot 命令
+func startTelegramPolling() {
+	log.Println("Telegram Bot 命令监听已启动")
+	client := &http.Client{Timeout: 35 * time.Second}
+	offset := 0
+
+	for {
+		updates, newOffset, err := getTelegramUpdates(client, offset)
+		if err != nil {
+			log.Printf("获取 Telegram 更新失败: %v", err)
+			time.Sleep(5 * time.Second)
+			continue
+		}
+		offset = newOffset
+		for _, u := range updates {
+			if u.Message != nil {
+				handleTelegramCommand(u.Message)
+			}
+		}
+	}
+}
+
+// getTelegramUpdates 通过长轮询获取新消息
+func getTelegramUpdates(client *http.Client, offset int) ([]tgUpdate, int, error) {
+	apiURL := fmt.Sprintf(
+		"https://api.telegram.org/bot%s/getUpdates?offset=%d&timeout=30",
+		config.Telegram.Token, offset,
+	)
+	resp, err := client.Get(apiURL)
+	if err != nil {
+		return nil, offset, fmt.Errorf("请求失败: %w", err)
+	}
+	defer resp.Body.Close()
+
+	var result tgUpdatesResp
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, offset, fmt.Errorf("解析响应失败: %w", err)
+	}
+	if !result.OK {
+		return nil, offset, fmt.Errorf("Telegram API 返回 ok=false")
+	}
+
+	newOffset := offset
+	for _, u := range result.Result {
+		if u.UpdateID+1 > newOffset {
+			newOffset = u.UpdateID + 1
+		}
+	}
+	return result.Result, newOffset, nil
+}
+
+// handleTelegramCommand 处理来自 Bot 的命令消息
+func handleTelegramCommand(msg *tgMessage) {
+	if !isAllowedChat(msg.Chat.ID) {
+		log.Printf("忽略来自未授权 chat %d 的消息", msg.Chat.ID)
+		return
+	}
+	text := strings.TrimSpace(msg.Text)
+	if !strings.HasPrefix(text, "/") {
+		return
+	}
+	reply := dispatchCommand(text)
+	if reply == "" {
+		return
+	}
+	if err := sendTelegramMessage(msg.Chat.ID, reply); err != nil {
+		log.Printf("发送 Telegram 回复失败: %v", err)
+	}
+}
+
+// dispatchCommand 解析并执行命令，返回回复文本
+func dispatchCommand(text string) string {
+	switch {
+	case text == "/help":
+		return "🤖 <b>可用命令:</b>\n\n" +
+			"/keywords — 查看关键词列表\n" +
+			"/add &lt;关键词&gt; — 添加关键词\n" +
+			"/del &lt;关键词&gt; — 删除关键词\n" +
+			"/status — 查看运行状态\n" +
+			"/help — 显示帮助"
+
+	case text == "/keywords":
+		configMu.RLock()
+		kws := make([]string, len(config.Keywords))
+		copy(kws, config.Keywords)
+		configMu.RUnlock()
+		if len(kws) == 0 {
+			return "📋 当前没有设置任何关键词"
+		}
+		lines := make([]string, len(kws))
+		for i, kw := range kws {
+			lines[i] = fmt.Sprintf("%d. %s", i+1, kw)
+		}
+		return "📋 <b>当前关键词列表:</b>\n" + strings.Join(lines, "\n")
+
+	case text == "/add":
+		return "❌ 请提供关键词，例如: /add 搬瓦工"
+
+	case strings.HasPrefix(text, "/add "):
+		kw := strings.TrimSpace(text[5:])
+		if kw == "" {
+			return "❌ 请提供关键词，例如: /add 搬瓦工"
+		}
+		configMu.Lock()
+		for _, existing := range config.Keywords {
+			if existing == kw {
+				configMu.Unlock()
+				return fmt.Sprintf("⚠️ 关键词 <b>%s</b> 已存在", kw)
+			}
+		}
+		config.Keywords = append(config.Keywords, kw)
+		configMu.Unlock()
+		if err := saveConfig(); err != nil {
+			log.Printf("保存配置失败: %v", err)
+			return fmt.Sprintf("✅ 已添加关键词 <b>%s</b>，但保存配置失败: %v", kw, err)
+		}
+		log.Printf("Telegram 命令: 添加关键词 [%s]", kw)
+		return fmt.Sprintf("✅ 已添加关键词: <b>%s</b>", kw)
+
+	case text == "/del" || text == "/remove":
+		return "❌ 请提供关键词，例如: /del 搬瓦工"
+
+	case strings.HasPrefix(text, "/del ") || strings.HasPrefix(text, "/remove "):
+		var kw string
+		if strings.HasPrefix(text, "/del ") {
+			kw = strings.TrimSpace(text[5:])
+		} else {
+			kw = strings.TrimSpace(text[8:])
+		}
+		if kw == "" {
+			return "❌ 请提供关键词，例如: /del 搬瓦工"
+		}
+		configMu.Lock()
+		found := false
+		newKws := config.Keywords[:0:0]
+		for _, existing := range config.Keywords {
+			if existing == kw {
+				found = true
+			} else {
+				newKws = append(newKws, existing)
+			}
+		}
+		if found {
+			config.Keywords = newKws
+		}
+		configMu.Unlock()
+		if !found {
+			return fmt.Sprintf("⚠️ 关键词 <b>%s</b> 不存在", kw)
+		}
+		if err := saveConfig(); err != nil {
+			log.Printf("保存配置失败: %v", err)
+			return fmt.Sprintf("✅ 已删除关键词 <b>%s</b>，但保存配置失败: %v", kw, err)
+		}
+		log.Printf("Telegram 命令: 删除关键词 [%s]", kw)
+		return fmt.Sprintf("✅ 已删除关键词: <b>%s</b>", kw)
+
+	case text == "/status":
+		configMu.RLock()
+		kwCount := len(config.Keywords)
+		configMu.RUnlock()
+		return fmt.Sprintf(
+			"📊 <b>运行状态</b>\n\n"+
+				"📡 <b>RSS 源:</b> %s\n"+
+				"⏱ <b>执行频率:</b> %s\n"+
+				"🔍 <b>关键词数量:</b> %d\n"+
+				"💾 <b>缓存条目:</b> %d\n"+
+				"🕐 <b>当前时间:</b> %s",
+			config.RSS.URL,
+			getScheduleDesc(),
+			kwCount,
+			len(sentCache.Items),
+			time.Now().Format("2006-01-02 15:04:05"),
+		)
+	}
+	return ""
+}
+
+// emailEnabled 判断邮件是否已配置
+func emailEnabled() bool {
+	return config.SMTP.Host != "" && len(config.Email.To) > 0
+}
+
+// telegramEnabled 判断 Telegram 是否已配置
+func telegramEnabled() bool {
+	return config.Telegram.Token != "" && len(config.Telegram.ChatIDs) > 0
+}
+
+// sendTelegramMessage 向指定 chat 发送 Telegram 消息
+func sendTelegramMessage(chatID int64, text string) error {
+	apiURL := fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", config.Telegram.Token)
+
+	payload := map[string]interface{}{
+		"chat_id":                  chatID,
+		"text":                     text,
+		"parse_mode":               "HTML",
+		"disable_web_page_preview": true,
+	}
+
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("序列化请求体失败: %w", err)
+	}
+
+	resp, err := http.Post(apiURL, "application/json", bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("请求 Telegram API 失败: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := ioutil.ReadAll(resp.Body)
+		return fmt.Errorf("Telegram API 返回错误 %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	return nil
+}
+
+// sendTelegramToAll 向所有配置的 chat 发送消息
+func sendTelegramToAll(text string) error {
+	var lastErr error
+	for _, chatID := range config.Telegram.ChatIDs {
+		if err := sendTelegramMessage(chatID, text); err != nil {
+			log.Printf("发送 Telegram 消息到 chat %d 失败: %v", chatID, err)
+			lastErr = err
+		}
+	}
+	return lastErr
+}
+
+// sendTelegramTestMessage 发送 Telegram 启动通知
+func sendTelegramTestMessage() error {
+	text := fmt.Sprintf(
+		"✅ <b>NodeSeek RSS Monitor 启动成功</b>\n\n"+
+			"📡 <b>RSS 源:</b> %s\n"+
+			"🔍 <b>监控关键词:</b> %s\n"+
+			"⏱ <b>执行频率:</b> %s\n"+
+			"🕐 <b>启动时间:</b> %s",
+		config.RSS.URL,
+		strings.Join(config.Keywords, ", "),
+		getScheduleDesc(),
+		time.Now().Format("2006-01-02 15:04:05"),
+	)
+	return sendTelegramToAll(text)
+}
+
+// sendTelegramNotification 发送 RSS 匹配通知
+func sendTelegramNotification(item Item, keywords []string) error {
+	text := fmt.Sprintf(
+		"🔔 <b>%s</b>\n\n"+
+			"🏷 <b>匹配关键词:</b> %s\n"+
+			"👤 <b>作者:</b> %s\n"+
+			"📂 <b>分类:</b> %s\n"+
+			"🕐 <b>发布时间:</b> %s\n\n"+
+			"📄 <b>内容摘要:</b>\n%s\n\n"+
+			"🔗 <a href=\"%s\">查看完整内容</a>",
+		item.Title,
+		strings.Join(keywords, ", "),
+		item.Creator,
+		item.Category,
+		item.PubDate,
+		truncateText(stripHTML(item.Description), 300),
+		item.Link,
+	)
+	return sendTelegramToAll(text)
+}
+
+// truncateText 截断文本到指定长度
+func truncateText(text string, maxLen int) string {
+	runes := []rune(text)
+	if len(runes) <= maxLen {
+		return text
+	}
+	return string(runes[:maxLen]) + "..."
+}
+
+// stripHTML 简单移除 HTML 标签
+func stripHTML(s string) string {
+	var result strings.Builder
+	inTag := false
+	for _, r := range s {
+		switch {
+		case r == '<':
+			inTag = true
+		case r == '>':
+			inTag = false
+		case !inTag:
+			result.WriteRune(r)
+		}
+	}
+	return strings.TrimSpace(result.String())
 }

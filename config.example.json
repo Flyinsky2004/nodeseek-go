@@ -25,5 +25,9 @@
     ],
     "subject": "[NodeSeek RSS] {title}"
   },
+  "telegram": {
+    "token": "",
+    "chat_ids": []
+  },
   "cache_file": "sent_cache.json"
 }
