@@ -291,10 +291,23 @@ func checkRSS() error {
 
 		processedCount++
 
-		// 检查是否匹配关键词
+		// 检查是否匹配关键词（大小写不敏感；空格分隔的词组需全部出现）
 		matchedKeywords := []string{}
+		titleLower := strings.ToLower(item.Title)
+		descLower := strings.ToLower(item.Description)
 		for _, keyword := range keywords {
-			if strings.Contains(item.Title, keyword) || strings.Contains(item.Description, keyword) {
+			parts := strings.Fields(strings.ToLower(keyword))
+			if len(parts) == 0 {
+				continue
+			}
+			allMatch := true
+			for _, part := range parts {
+				if !strings.Contains(titleLower, part) && !strings.Contains(descLower, part) {
+					allMatch = false
+					break
+				}
+			}
+			if allMatch {
 				matchedKeywords = append(matchedKeywords, keyword)
 			}
 		}
