@@ -34,9 +34,10 @@ type Config struct {
 		Secure bool   `json:"secure"`
 	} `json:"smtp"`
 	Email struct {
-		From    string   `json:"from"`
-		To      []string `json:"to"`
-		Subject string   `json:"subject"`
+		From     string   `json:"from"`
+		To       []string `json:"to"`
+		Subject  string   `json:"subject"`
+		Disabled bool     `json:"disabled"`
 	} `json:"email"`
 	Telegram struct {
 		Token   string  `json:"token"`
@@ -880,6 +881,8 @@ func dispatchCommand(text string) string {
 			"/keywords — 查看关键词列表\n" +
 			"/add &lt;关键词&gt; — 添加关键词\n" +
 			"/del &lt;关键词&gt; — 删除关键词\n" +
+			"/email on — 开启邮件通知\n" +
+			"/email off — 关闭邮件通知\n" +
 			"/status — 查看运行状态\n" +
 			"/help — 显示帮助"
 
@@ -958,20 +961,58 @@ func dispatchCommand(text string) string {
 		log.Printf("Telegram 命令: 删除关键词 [%s]", kw)
 		return fmt.Sprintf("✅ 已删除关键词: <b>%s</b>", kw)
 
+	case text == "/email on":
+		configMu.Lock()
+		config.Email.Disabled = false
+		configMu.Unlock()
+		if err := saveConfig(); err != nil {
+			log.Printf("保存配置失败: %v", err)
+			return fmt.Sprintf("✅ 邮件通知已开启，但保存配置失败: %v", err)
+		}
+		log.Println("Telegram 命令: 开启邮件通知")
+		return "✅ 邮件通知已开启"
+
+	case text == "/email off":
+		configMu.Lock()
+		config.Email.Disabled = true
+		configMu.Unlock()
+		if err := saveConfig(); err != nil {
+			log.Printf("保存配置失败: %v", err)
+			return fmt.Sprintf("✅ 邮件通知已关闭，但保存配置失败: %v", err)
+		}
+		log.Println("Telegram 命令: 关闭邮件通知")
+		return "🔕 邮件通知已关闭"
+
+	case text == "/email":
+		configMu.RLock()
+		disabled := config.Email.Disabled
+		configMu.RUnlock()
+		if disabled {
+			return "🔕 邮件通知当前已关闭\n\n使用 /email on 开启"
+		}
+		return "✅ 邮件通知当前已开启\n\n使用 /email off 关闭"
+
 	case text == "/status":
 		configMu.RLock()
 		kwCount := len(config.Keywords)
+		emailDisabled := config.Email.Disabled
 		configMu.RUnlock()
+		emailStatus := "✅ 开启"
+		if emailDisabled {
+			emailStatus = "🔕 关闭"
+		}
 		return fmt.Sprintf(
 			"📊 <b>运行状态</b>\n\n"+
 				"📡 <b>RSS 源:</b> %s\n"+
 				"⏱ <b>执行频率:</b> %s\n"+
 				"🔍 <b>关键词数量:</b> %d\n"+
+				"📧 <b>邮件通知:</b> %s\n"+
 				"💾 <b>缓存条目:</b> %d\n"+
 				"🕐 <b>当前时间:</b> %s",
 			config.RSS.URL,
 			getScheduleDesc(),
 			kwCount,
+			emailStatus,
 			len(sentCache.Items),
 			time.Now().Format("2006-01-02 15:04:05"),
 		)
@@ -979,9 +1020,9 @@ func dispatchCommand(text string) string {
 	return ""
 }
 
-// emailEnabled 判断邮件是否已配置
+// emailEnabled 判断邮件是否已配置且未被禁用
 func emailEnabled() bool {
-	return config.SMTP.Host != "" && len(config.Email.To) > 0
+	return config.SMTP.Host != "" && len(config.Email.To) > 0 && !config.Email.Disabled
 }
 
 // telegramEnabled 判断 Telegram 是否已配置
