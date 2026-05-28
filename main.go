@@ -18,14 +18,47 @@ import (
 	"gopkg.in/gomail.v2"
 )
 
+// RSSFeed 单个 RSS 源配置
+type RSSFeed struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+	URL  string `json:"url"`
+}
+
+// Keyword 关键词配置
+type Keyword struct {
+	Text   string `json:"text"`
+	Source string `json:"source"` // "ns" / "ld" / "" = all feeds
+}
+
+// KeywordList 支持旧版 string 数组向后兼容
+type KeywordList []Keyword
+
+func (kl *KeywordList) UnmarshalJSON(data []byte) error {
+	var kws []Keyword
+	if err := json.Unmarshal(data, &kws); err == nil {
+		*kl = KeywordList(kws)
+		return nil
+	}
+	var strs []string
+	if err := json.Unmarshal(data, &strs); err != nil {
+		return fmt.Errorf("keywords: must be string array or object array with text/source")
+	}
+	for _, s := range strs {
+		*kl = append(*kl, Keyword{Text: s})
+	}
+	return nil
+}
+
 // Config 配置结构
 type Config struct {
 	RSS struct {
-		URL             string `json:"url"`
-		IntervalSeconds int    `json:"interval_seconds"`
-		Cron            string `json:"cron"`
+		URL             string    `json:"url"`
+		IntervalSeconds int       `json:"interval_seconds"`
+		Cron            string    `json:"cron"`
+		Feeds           []RSSFeed `json:"feeds"`
 	} `json:"rss"`
-	Keywords []string `json:"keywords"`
+	Keywords KeywordList `json:"keywords"`
 	SMTP     struct {
 		Host   string `json:"host"`
 		Port   int    `json:"port"`
@@ -66,7 +99,16 @@ type Item struct {
 	GUID        string `xml:"guid"`
 	Category    string `xml:"category"`
 	Creator     string `xml:"creator"`
+	DCCreator   string `xml:"http://purl.org/dc/elements/1.1/ creator"`
 	PubDate     string `xml:"pubDate"`
+}
+
+// GetCreator 返回作者，兼容 dc:creator 和 creator 两种格式
+func (i Item) GetCreator() string {
+	if i.DCCreator != "" {
+		return i.DCCreator
+	}
+	return i.Creator
 }
 
 // SentCache 已发送缓存
@@ -76,7 +118,7 @@ type SentCache struct {
 
 var (
 	config    Config
-	configMu  sync.RWMutex // 保护 config.Keywords 的并发读写
+	configMu  sync.RWMutex
 	sentCache SentCache
 	execDir   string
 )
@@ -116,11 +158,13 @@ func main() {
 	loadCache()
 
 	// 发送启动测试邮件
-	log.Println("发送启动测试邮件...")
-	if err := sendTestEmail(); err != nil {
-		log.Printf("测试邮件发送失败: %v (程序将继续运行)", err)
-	} else {
-		log.Println("测试邮件发送成功")
+	if emailEnabled() {
+		log.Println("发送启动测试邮件...")
+		if err := sendTestEmail(); err != nil {
+			log.Printf("测试邮件发送失败: %v (程序将继续运行)", err)
+		} else {
+			log.Println("测试邮件发送成功")
+		}
 	}
 
 	// 发送启动 Telegram 通知
@@ -146,7 +190,6 @@ func main() {
 
 	// 根据配置选择调度模式
 	if config.RSS.IntervalSeconds > 0 {
-		// 使用秒级间隔模式
 		log.Printf("RSS 监控服务已启动，每 %d 秒执行一次", config.RSS.IntervalSeconds)
 		ticker := time.NewTicker(time.Duration(config.RSS.IntervalSeconds) * time.Second)
 		defer ticker.Stop()
@@ -158,7 +201,6 @@ func main() {
 			}
 		}
 	} else if config.RSS.Cron != "" {
-		// 使用 Cron 表达式模式
 		log.Printf("RSS 监控服务已启动，定时规则: %s", config.RSS.Cron)
 		c := cron.New()
 		_, err := c.AddFunc(config.RSS.Cron, func() {
@@ -173,7 +215,6 @@ func main() {
 
 		c.Start()
 
-		// 保持程序运行
 		select {}
 	} else {
 		log.Fatalf("配置错误：必须设置 interval_seconds 或 cron 其中之一")
@@ -190,6 +231,46 @@ func initExecDir() error {
 	execDir = filepath.Dir(execPath)
 	log.Printf("可执行文件目录: %s", execDir)
 	return nil
+}
+
+// getFeeds 获取所有 RSS 源，向后兼容旧版单 URL 配置
+func getFeeds() []RSSFeed {
+	if len(config.RSS.Feeds) > 0 {
+		return config.RSS.Feeds
+	}
+	if config.RSS.URL != "" {
+		return []RSSFeed{
+			{ID: "ns", Name: "NodeSeek", URL: config.RSS.URL},
+		}
+	}
+	return nil
+}
+
+// matchKeywords 匹配关键词（大小写不敏感；空格分隔的词组需全部出现）
+func matchKeywords(title, description string, keywordTexts []string) []string {
+	var matched []string
+	titleLower := strings.ToLower(title)
+	descLower := strings.ToLower(description)
+	for _, keyword := range keywordTexts {
+		if keyword == "" {
+			continue
+		}
+		parts := strings.Fields(strings.ToLower(keyword))
+		if len(parts) == 0 {
+			continue
+		}
+		allMatch := true
+		for _, part := range parts {
+			if !strings.Contains(titleLower, part) && !strings.Contains(descLower, part) {
+				allMatch = false
+				break
+			}
+		}
+		if allMatch {
+			matched = append(matched, keyword)
+		}
+	}
+	return matched
 }
 
 // loadConfig 加载配置文件
@@ -247,120 +328,116 @@ func saveCache() error {
 	return ioutil.WriteFile(cachePath, data, 0644)
 }
 
-// checkRSS 检查 RSS 源
+// checkRSS 检查所有 RSS 源
 func checkRSS() error {
-	// 获取 RSS 内容
-	resp, err := http.Get(config.RSS.URL)
-	if err != nil {
-		return fmt.Errorf("获取 RSS 失败: %w", err)
-	}
-	defer resp.Body.Close()
+	feeds := getFeeds()
 
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("HTTP 状态码错误: %d", resp.StatusCode)
-	}
-
-	// 读取响应内容
-	body, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		return fmt.Errorf("读取响应内容失败: %w", err)
-	}
-
-	// 解析 RSS
-	var rss RSS
-	if err := xml.Unmarshal(body, &rss); err != nil {
-		return fmt.Errorf("解析 RSS 失败: %w", err)
-	}
-
-	log.Printf("解析到 %d 条 RSS 项", len(rss.Channel.Items))
-
-	// 快照当前关键词，避免遍历过程中被并发修改
 	configMu.RLock()
-	keywords := make([]string, len(config.Keywords))
+	keywords := make([]Keyword, len(config.Keywords))
 	copy(keywords, config.Keywords)
 	configMu.RUnlock()
 
-	processedCount := 0
-	sentCount := 0
+	totalProcessed := 0
+	totalSent := 0
 
-	// 遍历 RSS 项
-	for _, item := range rss.Channel.Items {
-		// 检查是否已发送
-		if _, exists := sentCache.Items[item.GUID]; exists {
+	for _, feed := range feeds {
+		// 过滤匹配该源的关键词文本（source="" 匹配所有源）
+		var feedKeywordTexts []string
+		for _, kw := range keywords {
+			if kw.Source == "" || kw.Source == feed.ID {
+				feedKeywordTexts = append(feedKeywordTexts, kw.Text)
+			}
+		}
+
+		log.Printf("检查 %s RSS (%s)", feed.Name, feed.URL)
+
+		resp, err := http.Get(feed.URL)
+		if err != nil {
+			log.Printf("获取 %s RSS 失败: %v", feed.Name, err)
 			continue
 		}
 
-		processedCount++
-
-		// 检查是否匹配关键词（大小写不敏感；空格分隔的词组需全部出现）
-		matchedKeywords := []string{}
-		titleLower := strings.ToLower(item.Title)
-		descLower := strings.ToLower(item.Description)
-		for _, keyword := range keywords {
-			parts := strings.Fields(strings.ToLower(keyword))
-			if len(parts) == 0 {
-				continue
-			}
-			allMatch := true
-			for _, part := range parts {
-				if !strings.Contains(titleLower, part) && !strings.Contains(descLower, part) {
-					allMatch = false
-					break
-				}
-			}
-			if allMatch {
-				matchedKeywords = append(matchedKeywords, keyword)
-			}
+		if resp.StatusCode != http.StatusOK {
+			resp.Body.Close()
+			log.Printf("%s HTTP 状态码错误: %d", feed.Name, resp.StatusCode)
+			continue
 		}
 
-		if len(matchedKeywords) > 0 {
-			log.Printf("匹配到关键词 [%s]: %s", strings.Join(matchedKeywords, ", "), item.Title)
+		body, err := ioutil.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			log.Printf("读取 %s RSS 失败: %v", feed.Name, err)
+			continue
+		}
 
-			notifyFailed := false
+		var rss RSS
+		if err := xml.Unmarshal(body, &rss); err != nil {
+			log.Printf("解析 %s RSS 失败: %v", feed.Name, err)
+			continue
+		}
 
-			// 发送邮件
-			if emailEnabled() {
-				if err := sendEmail(item, matchedKeywords); err != nil {
-					log.Printf("发送邮件失败: %v", err)
-					notifyFailed = true
-				}
+		log.Printf("%s 解析到 %d 条 RSS 项", feed.Name, len(rss.Channel.Items))
+
+		for _, item := range rss.Channel.Items {
+			cacheKey := feed.ID + ":" + item.GUID
+
+			if _, exists := sentCache.Items[cacheKey]; exists {
+				continue
 			}
-
-			// 发送 Telegram 通知
-			if telegramEnabled() {
-				if err := sendTelegramNotification(item, matchedKeywords); err != nil {
-					log.Printf("发送 Telegram 通知失败: %v", err)
-					notifyFailed = true
-				}
-			}
-
-			if notifyFailed {
+			// 向后兼容旧缓存 key（无前缀）
+			if t, exists := sentCache.Items[item.GUID]; exists {
+				sentCache.Items[cacheKey] = t
+				delete(sentCache.Items, item.GUID)
 				continue
 			}
 
-			// 标记为已发送
-			sentCache.Items[item.GUID] = time.Now()
-			sentCount++
+			totalProcessed++
 
-			// 保存缓存
-			if err := saveCache(); err != nil {
-				log.Printf("保存缓存失败: %v", err)
+			matchedKeywords := matchKeywords(item.Title, item.Description, feedKeywordTexts)
+
+			if len(matchedKeywords) > 0 {
+				log.Printf("[%s] 匹配到关键词 [%s]: %s", feed.Name, strings.Join(matchedKeywords, ", "), item.Title)
+
+				notifyFailed := false
+
+				if emailEnabled() {
+					if err := sendEmail(item, matchedKeywords, feed); err != nil {
+						log.Printf("发送邮件失败: %v", err)
+						notifyFailed = true
+					}
+				}
+
+				if telegramEnabled() {
+					if err := sendTelegramNotification(item, matchedKeywords, feed); err != nil {
+						log.Printf("发送 Telegram 通知失败: %v", err)
+						notifyFailed = true
+					}
+				}
+
+				if notifyFailed {
+					continue
+				}
+
+				sentCache.Items[cacheKey] = time.Now()
+				totalSent++
+
+				if err := saveCache(); err != nil {
+					log.Printf("保存缓存失败: %v", err)
+				}
+			} else {
+				sentCache.Items[cacheKey] = time.Now()
 			}
-		} else {
-			// 即使不匹配也标记，避免重复检查
-			sentCache.Items[item.GUID] = time.Now()
 		}
 	}
 
-	log.Printf("任务完成 - 处理: %d 条新项, 发送: %d 条通知", processedCount, sentCount)
+	log.Printf("任务完成 - 处理: %d 条新项, 发送: %d 条通知", totalProcessed, totalSent)
 
-	// 保存缓存
 	return saveCache()
 }
 
 // sendTestEmail 发送测试邮件
 func sendTestEmail() error {
-	subject := "[NodeSeek RSS] 程序启动测试邮件"
+	subject := "[RSS Monitor] 程序启动测试邮件"
 
 	// 构建测试邮件内容
 	htmlBody := fmt.Sprintf(`
@@ -509,14 +586,14 @@ func sendTestEmail() error {
       </div>
     </div>
     <div class="footer">
-      NodeSeek RSS Monitor · %s
+      RSS Monitor · %s
     </div>
   </div>
 </body>
 </html>
 	`,
-		config.RSS.URL,
-		strings.Join(config.Keywords, ", "),
+		formatFeedsForDisplay(getFeeds()),
+		formatKeywordsForDisplay(config.Keywords),
 		getScheduleDesc(),
 		strings.Join(config.Email.To, ", "),
 		time.Now().Format("2006-01-02 15:04:05"),
@@ -556,9 +633,10 @@ func getScheduleDesc() string {
 }
 
 // sendEmail 发送邮件
-func sendEmail(item Item, keywords []string) error {
+func sendEmail(item Item, keywords []string, feed RSSFeed) error {
 	// 替换邮件主题中的占位符
 	subject := strings.ReplaceAll(config.Email.Subject, "{title}", item.Title)
+	subject = strings.ReplaceAll(subject, "{source}", feed.Name)
 
 	// 构建 HTML 邮件内容
 	htmlBody := fmt.Sprintf(`
@@ -710,6 +788,9 @@ func sendEmail(item Item, keywords []string) error {
       </div>
       <div class="meta">
         <div class="meta-item">
+          <span class="meta-label">来源</span>
+          <span class="meta-value">%s</span>
+        </div>        <div class="meta-item">
           <span class="meta-label">发布时间</span>
           <span class="meta-value">%s</span>
         </div>
@@ -733,7 +814,7 @@ func sendEmail(item Item, keywords []string) error {
       </div>
     </div>
     <div class="footer">
-      NodeSeek RSS Monitor
+      RSS Monitor
     </div>
   </div>
 </body>
@@ -741,8 +822,8 @@ func sendEmail(item Item, keywords []string) error {
 	`,
 		item.Title,
 		formatKeywords(keywords),
-		item.PubDate,
-		item.Creator,
+			feed.Name,		item.PubDate,
+		item.GetCreator(),
 		item.Category,
 		item.Description,
 		item.Link,
@@ -779,6 +860,56 @@ func formatKeywords(keywords []string) string {
 		result = append(result, fmt.Sprintf(`<span class="keywords">%s</span>`, kw))
 	}
 	return strings.Join(result, "")
+}
+
+// formatFeedsForDisplay 格式化多源信息用于邮件显示
+func formatFeedsForDisplay(feeds []RSSFeed) string {
+	var lines []string
+	for _, f := range feeds {
+		lines = append(lines, fmt.Sprintf("%s (%s)", f.Name, f.URL))
+	}
+	return strings.Join(lines, "<br>")
+}
+
+// formatFeedsForDisplayTG 格式化多源信息用于 Telegram 显示
+func formatFeedsForDisplayTG(feeds []RSSFeed) string {
+	var lines []string
+	for _, f := range feeds {
+		lines = append(lines, fmt.Sprintf("%s (%s)", f.Name, f.URL))
+	}
+	return strings.Join(lines, "\n")
+}
+
+// formatKeywordsForDisplayTG 格式化关键词列表（含来源）用于 Telegram 显示
+func formatKeywordsForDisplayTG(keywords []Keyword) string {
+	var parts []string
+	for _, kw := range keywords {
+		src := kw.Source
+		if src == "" {
+			src = "all"
+		}
+		parts = append(parts, fmt.Sprintf("[%s] %s", src, kw.Text))
+	}
+	if len(parts) == 0 {
+		return "无"
+	}
+	return strings.Join(parts, ", ")
+}
+
+// formatKeywordsForDisplay 格式化关键词列表（含来源）用于邮件显示
+func formatKeywordsForDisplay(keywords []Keyword) string {
+	var parts []string
+	for _, kw := range keywords {
+		src := kw.Source
+		if src == "" {
+			src = "all"
+		}
+		parts = append(parts, fmt.Sprintf("[%s] %s", src, kw.Text))
+	}
+	if len(parts) == 0 {
+		return "无"
+	}
+	return strings.Join(parts, ", ")
 }
 
 // saveConfig 将当前配置持久化到 config.json
@@ -879,8 +1010,9 @@ func dispatchCommand(text string) string {
 	case text == "/help":
 		return "🤖 <b>可用命令:</b>\n\n" +
 			"/keywords — 查看关键词列表\n" +
-			"/add &lt;关键词&gt; — 添加关键词\n" +
-			"/del &lt;关键词&gt; — 删除关键词\n" +
+			"/add ns|ld &lt;关键词&gt; — 添加关键词(指定来源)\n" +
+			"/add ns|ld &lt;关键词&gt; — 添加关键词(指定来源)(监听所有源)\n" +
+			"/del ns|ld &lt;关键词&gt; — 删除关键词\n" +
 			"/email on — 开启邮件通知\n" +
 			"/email off — 关闭邮件通知\n" +
 			"/status — 查看运行状态\n" +
@@ -888,7 +1020,7 @@ func dispatchCommand(text string) string {
 
 	case text == "/keywords":
 		configMu.RLock()
-		kws := make([]string, len(config.Keywords))
+		kws := make([]Keyword, len(config.Keywords))
 		copy(kws, config.Keywords)
 		configMu.RUnlock()
 		if len(kws) == 0 {
@@ -896,52 +1028,88 @@ func dispatchCommand(text string) string {
 		}
 		lines := make([]string, len(kws))
 		for i, kw := range kws {
-			lines[i] = fmt.Sprintf("%d. %s", i+1, kw)
+			src := kw.Source
+			if src == "" {
+				src = "all"
+			}
+			lines[i] = fmt.Sprintf("%d. [%s] %s", i+1, src, kw.Text)
 		}
 		return "📋 <b>当前关键词列表:</b>\n" + strings.Join(lines, "\n")
 
+
 	case text == "/add":
-		return "❌ 请提供关键词，例如: /add 搬瓦工"
+		return "❌ 请提供关键词，例如: /add ns 搬瓦工 或 /add 关键词(监听所有)"
 
 	case strings.HasPrefix(text, "/add "):
-		kw := strings.TrimSpace(text[5:])
-		if kw == "" {
-			return "❌ 请提供关键词，例如: /add 搬瓦工"
+		args := strings.Fields(text[5:])
+		if len(args) == 0 {
+			return "❌ 请提供关键词，例如: /add ns 搬瓦工"
+		}
+		var source, keyword string
+		if len(args) >= 2 && (args[0] == "ns" || args[0] == "ld") {
+			source = args[0]
+			keyword = strings.Join(args[1:], " ")
+		} else {
+			source = ""
+			keyword = strings.Join(args, " ")
+		}
+		if keyword == "" {
+			return "❌ 请提供关键词，例如: /add ns 搬瓦工"
 		}
 		configMu.Lock()
 		for _, existing := range config.Keywords {
-			if existing == kw {
+			if existing.Text == keyword && existing.Source == source {
 				configMu.Unlock()
-				return fmt.Sprintf("⚠️ 关键词 <b>%s</b> 已存在", kw)
+				srcLabel := source
+				if srcLabel == "" {
+					srcLabel = "all"
+				}
+				return fmt.Sprintf("⚠️ 关键词 [%s] <b>%s</b> 已存在", srcLabel, keyword)
 			}
 		}
-		config.Keywords = append(config.Keywords, kw)
+		config.Keywords = append(config.Keywords, Keyword{Text: keyword, Source: source})
 		configMu.Unlock()
 		if err := saveConfig(); err != nil {
 			log.Printf("保存配置失败: %v", err)
-			return fmt.Sprintf("✅ 已添加关键词 <b>%s</b>，但保存配置失败: %v", kw, err)
+			return fmt.Sprintf("✅ 已添加关键词 <b>%s</b>，但保存配置失败: %v", keyword, err)
 		}
-		log.Printf("Telegram 命令: 添加关键词 [%s]", kw)
-		return fmt.Sprintf("✅ 已添加关键词: <b>%s</b>", kw)
+		srcLabel := source
+		if srcLabel == "" {
+			srcLabel = "all"
+		}
+		log.Printf("Telegram 命令: 添加关键词 [%s] %s", srcLabel, keyword)
+		return fmt.Sprintf("✅ 已添加关键词: [%s] <b>%s</b>", srcLabel, keyword)
 
 	case text == "/del" || text == "/remove":
-		return "❌ 请提供关键词，例如: /del 搬瓦工"
+		return "❌ 请提供关键词，例如: /del ns 搬瓦工 或 /del 关键词"
 
 	case strings.HasPrefix(text, "/del ") || strings.HasPrefix(text, "/remove "):
-		var kw string
+		var rawArgs string
 		if strings.HasPrefix(text, "/del ") {
-			kw = strings.TrimSpace(text[5:])
+			rawArgs = strings.TrimSpace(text[5:])
 		} else {
-			kw = strings.TrimSpace(text[8:])
+			rawArgs = strings.TrimSpace(text[8:])
 		}
-		if kw == "" {
-			return "❌ 请提供关键词，例如: /del 搬瓦工"
+		args := strings.Fields(rawArgs)
+		if len(args) == 0 {
+			return "❌ 请提供关键词，例如: /del ns 搬瓦工"
+		}
+		var source, keyword string
+		if len(args) >= 2 && (args[0] == "ns" || args[0] == "ld") {
+			source = args[0]
+			keyword = strings.Join(args[1:], " ")
+		} else {
+			source = ""
+			keyword = strings.Join(args, " ")
+		}
+		if keyword == "" {
+			return "❌ 请提供关键词，例如: /del ns 搬瓦工"
 		}
 		configMu.Lock()
 		found := false
-		newKws := config.Keywords[:0:0]
+		newKws := make(KeywordList, 0, len(config.Keywords))
 		for _, existing := range config.Keywords {
-			if existing == kw {
+			if existing.Text == keyword && existing.Source == source {
 				found = true
 			} else {
 				newKws = append(newKws, existing)
@@ -952,14 +1120,14 @@ func dispatchCommand(text string) string {
 		}
 		configMu.Unlock()
 		if !found {
-			return fmt.Sprintf("⚠️ 关键词 <b>%s</b> 不存在", kw)
+			return fmt.Sprintf("⚠️ 关键词 <b>%s</b> 不存在", keyword)
 		}
 		if err := saveConfig(); err != nil {
 			log.Printf("保存配置失败: %v", err)
-			return fmt.Sprintf("✅ 已删除关键词 <b>%s</b>，但保存配置失败: %v", kw, err)
+			return fmt.Sprintf("✅ 已删除关键词 <b>%s</b>，但保存配置失败: %v", keyword, err)
 		}
-		log.Printf("Telegram 命令: 删除关键词 [%s]", kw)
-		return fmt.Sprintf("✅ 已删除关键词: <b>%s</b>", kw)
+		log.Printf("Telegram 命令: 删除关键词 [%s]", keyword)
+		return fmt.Sprintf("✅ 已删除关键词: <b>%s</b>", keyword)
 
 	case text == "/email on":
 		configMu.Lock()
@@ -1003,13 +1171,13 @@ func dispatchCommand(text string) string {
 		}
 		return fmt.Sprintf(
 			"📊 <b>运行状态</b>\n\n"+
-				"📡 <b>RSS 源:</b> %s\n"+
+				"📡 <b>RSS 源:</b>\n%s\n\n"+
 				"⏱ <b>执行频率:</b> %s\n"+
 				"🔍 <b>关键词数量:</b> %d\n"+
 				"📧 <b>邮件通知:</b> %s\n"+
 				"💾 <b>缓存条目:</b> %d\n"+
 				"🕐 <b>当前时间:</b> %s",
-			config.RSS.URL,
+			formatFeedsForDisplayTG(getFeeds()),
 			getScheduleDesc(),
 			kwCount,
 			emailStatus,
@@ -1018,8 +1186,7 @@ func dispatchCommand(text string) string {
 		)
 	}
 	return ""
-}
-
+}// sendTelegramMessage 向指定 chat 发送 Telegram 消息
 // emailEnabled 判断邮件是否已配置且未被禁用
 func emailEnabled() bool {
 	return config.SMTP.Host != "" && len(config.Email.To) > 0 && !config.Email.Disabled
@@ -1029,8 +1196,6 @@ func emailEnabled() bool {
 func telegramEnabled() bool {
 	return config.Telegram.Token != "" && len(config.Telegram.ChatIDs) > 0
 }
-
-// sendTelegramMessage 向指定 chat 发送 Telegram 消息
 func sendTelegramMessage(chatID int64, text string) error {
 	apiURL := fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", config.Telegram.Token)
 
@@ -1075,13 +1240,13 @@ func sendTelegramToAll(text string) error {
 // sendTelegramTestMessage 发送 Telegram 启动通知
 func sendTelegramTestMessage() error {
 	text := fmt.Sprintf(
-		"✅ <b>NodeSeek RSS Monitor 启动成功</b>\n\n"+
+		"✅ <b>RSS Monitor 启动成功</b>\n\n"+
 			"📡 <b>RSS 源:</b> %s\n"+
 			"🔍 <b>监控关键词:</b> %s\n"+
 			"⏱ <b>执行频率:</b> %s\n"+
 			"🕐 <b>启动时间:</b> %s",
-		config.RSS.URL,
-		strings.Join(config.Keywords, ", "),
+		formatFeedsForDisplayTG(getFeeds()),
+		formatKeywordsForDisplayTG(config.Keywords),
 		getScheduleDesc(),
 		time.Now().Format("2006-01-02 15:04:05"),
 	)
@@ -1089,18 +1254,19 @@ func sendTelegramTestMessage() error {
 }
 
 // sendTelegramNotification 发送 RSS 匹配通知
-func sendTelegramNotification(item Item, keywords []string) error {
+func sendTelegramNotification(item Item, keywords []string, feed RSSFeed) error {
 	text := fmt.Sprintf(
-		"🔔 <b>%s</b>\n\n"+
+		"🔔 [%s] <b>%s</b>\n\n"+
 			"🏷 <b>匹配关键词:</b> %s\n"+
 			"👤 <b>作者:</b> %s\n"+
 			"📂 <b>分类:</b> %s\n"+
 			"🕐 <b>发布时间:</b> %s\n\n"+
 			"📄 <b>内容摘要:</b>\n%s\n\n"+
 			"🔗 <a href=\"%s\">查看完整内容</a>",
+		feed.Name,
 		item.Title,
 		strings.Join(keywords, ", "),
-		item.Creator,
+		item.GetCreator(),
 		item.Category,
 		item.PubDate,
 		truncateText(stripHTML(item.Description), 300),

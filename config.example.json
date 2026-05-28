@@ -2,13 +2,27 @@
   "rss": {
     "url": "https://www.nodeseek.com/rss.xml",
     "interval_seconds": 30,
-    "cron": ""
+    "cron": "",
+    "feeds": [
+      {
+        "id": "ns",
+        "name": "NodeSeek",
+        "url": "https://www.nodeseek.com/rss.xml"
+      },
+      {
+        "id": "ld",
+        "name": "Linux.DO",
+        "url": "https://linux.do/latest.rss"
+      }
+    ]
   },
   "keywords": [
-    "德鸡",
-    "绿云",
-    "V.PS",
-    "搬瓦工"
+    { "text": "德鸡", "source": "" },
+    { "text": "绿云", "source": "" },
+    { "text": "V.PS", "source": "" },
+    { "text": "搬瓦工", "source": "" },
+    { "text": "Claude", "source": "ns" },
+    { "text": "Codex", "source": "ld" }
   ],
   "smtp": {
     "host": "smtp.gmail.com",
@@ -23,7 +37,7 @@
       "recipient1@example.com",
       "recipient2@example.com"
     ],
-    "subject": "[NodeSeek RSS] {title}"
+    "subject": "[RSS Monitor] {title}"
   },
   "telegram": {
     "token": "",
