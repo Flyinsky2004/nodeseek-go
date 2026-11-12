@@ -6,7 +6,6 @@
 *.dylib
 *.test
 *.out
-go.sum
 
 # 配置和缓存文件
 config.json
