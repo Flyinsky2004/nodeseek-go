@@ -41,7 +41,8 @@
   },
   "telegram": {
     "token": "",
-    "chat_ids": []
+    "chat_ids": [],
+    "admin_user_ids": []
   },
   "cache_file": "sent_cache.json"
 }

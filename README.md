@@ -13,6 +13,8 @@
 - **启动时发送测试邮件**，验证配置是否正确
 - 精美的 HTML 邮件模板（Next.js 黑白风格）
 - 本地缓存，记录已发送的帖子
+- **Telegram 按钮菜单**：状态、关键词、邮件开关、版本和更新都在同一条消息气泡内编辑，不刷屏
+- **自动更新**：从 GitHub Release 检查正式版，校验 SHA256 后原子替换并自动重启（Unix）
 
 ## 安装依赖
 
@@ -131,6 +133,16 @@ cp config.example.json config.json
 
 当 RSS 项的标题或描述包含任一关键词时，将触发邮件发送。
 
+也支持带来源的对象格式（`source` 为空表示监听所有源）：
+
+```json
+"keywords": [
+  { "text": "德鸡", "source": "" },
+  { "text": "Claude", "source": "ns" },
+  { "text": "Codex", "source": "ld" }
+]
+```
+
 ### SMTP 配置
 
 ```json
@@ -173,6 +185,78 @@ cp config.example.json config.json
 ```
 
 - `cache_file`: 缓存文件路径，用于记录已发送的帖子，避免重复发送
+
+### Telegram 配置
+
+```json
+"telegram": {
+  "token": "123456:ABC...",
+  "chat_ids": [123456789],
+  "admin_user_ids": []
+}
+```
+
+- `token`: BotFather 提供的 Bot Token
+- `chat_ids`: 允许使用 Bot 的私聊/群聊 ID 白名单
+- `admin_user_ids`: 可选。群聊中允许执行变更操作（增删关键词、邮件开关、安装更新）的用户 ID；私聊中默认只有聊天本人可以操作
+
+## Telegram 菜单
+
+在私聊或白名单群聊中发送 `/start` 或 `/menu` 打开菜单：
+
+- 📊 状态、🔍 关键词、📧 邮件开关、ℹ️ 帮助、🏷 版本、🔄 检查更新
+- 所有按钮都会调用 `answerCallbackQuery`；页面切换、刷新和执行结果通过 `editMessageText` 更新**原消息**，不会每点一次就产生新气泡
+- 关键词支持分页查看、按源添加、按源删除；添加时先选择源，再直接发送关键词文本，机器人会在菜单气泡内提示结果
+- 菜单消息被删除时会自动补发一次；重复点击（`message is not modified`）视为成功
+- 原有命令仍然可用：`/add`、`/del`、`/email on|off`、`/keywords`、`/status`、`/version`、`/help`
+- 群聊中的变更操作需要发送者在 `telegram.admin_user_ids` 中；私聊中只有聊天本人可以变更。查看类命令仍沿用 `chat_ids` 白名单
+
+## 版本与自动更新
+
+版本、提交和构建时间通过 `-ldflags` 注入：
+
+```bash
+go build -ldflags "-X main.version=v1.2.3 -X main.commit=$(git rev-parse HEAD) -X main.buildTime=2026-01-01T00:00:00Z" -o rss-monitor
+./rss-monitor --version
+```
+
+本地直接 `go build` 时版本为 `dev`。`--version` 在读取 `config.json` 之前执行，因此配置文件缺失也能查看版本。
+
+更新流程（Telegram 菜单 → 🏷 版本 → 🔄 检查更新）：
+
+1. 从 `https://api.github.com/repos/Flyinsky2004/nodeseek-go/releases/latest` 读取最新**正式** Release（draft/prerelease 会被拒绝）
+2. 按当前 `GOOS/GOARCH` 精确匹配资源名，例如 `nodeseek-rss-monitor-linux-amd64`
+3. 下载 `checksums.txt` 并校验目标资源的 SHA256；校验失败不会替换原程序
+4. 检查到新版本后只显示「确认安装」按钮；用户再次点击确认后才会安装。确认绑定当前聊天/消息/用户并带 10 分钟有效期，安装前会重新核对 tag、资源名和校验值
+5. 下载到可执行文件同目录的临时文件，校验通过后原子替换；Unix 会保留安全备份并在 `exec` 失败时回滚
+6. Unix 更新成功后执行 `exec` 重启当前程序；Windows 无法替换正在运行的 `.exe`，只会把新版本保存为 `<程序名>.new` 并提示手动替换，**不会谎报已更新**
+
+不会自动降级：当前版本是合法 SemVer 且不低于最新版时，菜单显示「已是最新版本」。开发构建（`dev`）允许手动安装最新正式版，但会明确提示无法按 SemVer 比较。
+
+手动更新：从 Release 页面下载对应平台的二进制，停止程序后替换可执行文件并重启。`config.json`、`sent_cache.json` 不会被更新流程修改。
+
+## 发布流程（GitHub Actions）
+
+`.github/workflows/release.yml` 在 GitHub Release 发布（`published`）时触发，也支持手动 `workflow_dispatch` 指定已发布的 tag：
+
+> **Release tag 必须是正式 SemVer**，例如 `v1.2.3`。构建版本取自 tag，而不是 Release 的显示名称；tag 不合法时 workflow 会在测试前直接失败，避免发布更新器无法识别的版本。
+
+1. 检出 Release 对应的 tag，运行 `go test ./...` 和 `go vet ./...`
+2. 使用 `CGO_ENABLED=0` 构建 linux/darwin/windows 的 amd64/arm64 六个二进制，ldflags 注入 tag、commit、构建时间
+3. 所有构建成功后才汇总产物，生成完整的 `checksums.txt`
+4. 通过 `gh release upload --clobber` 上传到**同一个已发布 Release**，不会创建重复 Release；draft/prerelease 会被跳过或拒绝
+
+资源命名固定为：
+
+```
+nodeseek-rss-monitor-linux-amd64
+nodeseek-rss-monitor-linux-arm64
+nodeseek-rss-monitor-darwin-amd64
+nodeseek-rss-monitor-darwin-arm64
+nodeseek-rss-monitor-windows-amd64.exe
+nodeseek-rss-monitor-windows-arm64.exe
+checksums.txt
+```
 
 ## Cron 表达式说明
 
@@ -223,11 +307,21 @@ cp config.example.json config.json
 
 ```
 nodeseek-rss-monitor/
-├── main.go                  # 主程序
+├── main.go                  # 主程序入口
+├── config.go                # 配置加载/原子保存
+├── rss.go                   # RSS 拉取、匹配与缓存
+├── notify.go                # 邮件/Telegram 通知
+├── telegram_bot.go          # Telegram 轮询与命令
+├── telegram_menu.go         # 内联键盘菜单与回调
+├── update.go                # GitHub Release 检查/下载/校验
+├── update_platform_unix.go  # Unix 原子替换与 exec 重启
+├── update_platform_windows.go # Windows 手动替换限制
+├── version.go               # 版本信息与 SemVer 比较
 ├── go.mod                   # Go 模块文件
 ├── config.example.json      # 配置文件示例
 ├── config.json              # 配置文件（需自行创建）
 ├── sent_cache.json          # 缓存文件（自动生成）
+├── .github/workflows/release.yml # Release 构建与上传
 ├── .gitignore               # Git 忽略文件
 └── README.md                # 说明文档
 ```
